@@ -134,7 +134,8 @@ nav button:focus-visible{outline:2px solid var(--accent);outline-offset:-4px}
 			<div class="notes-head"><h2>Notes</h2><small id="notesMeta"></small></div>
 			<div class="notes" id="notesView"></div>
 			<div class="row">
-				<button class="btn sm" id="copyNotes">Copy notes</button>
+				<button class="btn sm" id="saveFile">Save to file</button>
+				<button class="btn sm" id="copyNotes">Copy</button>
 				<button class="btn sm" id="readNotes">Read aloud</button>
 				<button class="btn sm" id="shareNotes">Share</button>
 			</div>
@@ -152,9 +153,14 @@ nav button:focus-visible{outline:2px solid var(--accent);outline-offset:-4px}
 					<div class="help">Quick turns run at low effort. "Think hard about…" and reviews run at high effort on the same model.</div>
 				</div>
 				<div class="field">
-					<label for="fmt">Note format</label>
+					<label for="preset">Note format</label>
+					<select id="preset">
+						<option value="tagged">Tagged decision log</option>
+						<option value="gdd">Game design document</option>
+						<option value="custom">Custom</option>
+					</select>
 					<textarea id="fmt"></textarea>
-					<div class="help">Or say it: "from now on, take notes as a numbered decision log."</div>
+					<div class="help">Or say it: "from now on, take notes as a numbered decision log." Editing the text directly switches this to Custom.</div>
 				</div>
 				<div class="field">
 					<label for="voice">Voice</label>
@@ -204,6 +210,13 @@ nav button:focus-visible{outline:2px solid var(--accent);outline-offset:-4px}
 'use strict';
 const DEFAULT_FORMAT = 'Markdown. One "## " heading per topic the designer raises. Under each, bullets prefixed with one tag: DECISION, IDEA, OPEN (an unresolved question), or REC (your recommendation, with its reason). Keep each bullet under 25 words.';
 
+const GDD_FORMAT = 'Markdown in the house style of a game design document. Flat headings only, one concept per "## " heading, never numbered. Name a mechanic as its name followed by its literal input in square brackets and capitals, like "Glide [HOLD SPACE]". Under each heading write one to three sentences of plain present tense saying exactly what happens, in the voice "The player can..." or "The player is equipped with...". State any conditional or dependent behaviour as its own short paragraph after the main description rather than folding it into the first. Define a term before using it elsewhere. Where something is unresolved, keep it in the document as a "NEEDS WORK:" block written as the raw open questions, not as a resolved answer. Mark an immature section by appending "[TBD]" to its heading. When a rule needs an instance, put the rule as a bullet and the concrete example as an indented sub-bullet beneath it. For an enemy or entity write "Name; HP, frame size, speed." then its behaviour. When citing another game, name it and say exactly what is being borrowed.';
+
+const PRESETS = {
+	tagged: {label:'Tagged decision log', text:DEFAULT_FORMAT},
+	gdd: {label:'Game design document', text:GDD_FORMAT}
+};
+
 const RULES = [
 'You are a game-design colleague talking with a designer by VOICE. They are on a phone, often doing something else with their hands, and everything in "speak" is read aloud by text-to-speech. You are project-agnostic: do not assume a particular game. Use everything you know about games and design. When one missing fact would change your advice, ask for it, but pair the question with your best concrete candidate.',
 '',
@@ -235,14 +248,14 @@ const LS = {
 const S = {
 	state:'idle', key:'', rec:null, micOk:null, paused:false, buffer:'', silenceTimer:0,
 	notes:'', notesUpdated:null, format:DEFAULT_FORMAT, turns:[], lastSpeak:'',
-	ctl:null, deepCtl:null, speakGuard:0, wakeLock:null, restartFails:0,
+	ctl:null, deepCtl:null, speakGuard:0, wakeLock:null, restartFails:0, fileHandle:null,
 	settings:{model:'claude-opus-5', voice:'', rate:1, lang:'en-US', silence:1.5}
 };
 const $ = id => document.getElementById(id);
 const el = {orb:$('orb'), word:$('stateword'), hint:$('statehint'), interim:$('interim'), log:$('log'), typed:$('typed'),
 	notesView:$('notesView'), notesMeta:$('notesMeta'), fmt:$('fmt'), voice:$('voice'), rate:$('rate'), rateVal:$('rateVal'),
 	lang:$('lang'), silence:$('silence'), silenceVal:$('silenceVal'), banner:$('banner'), chip:$('chipModel'),
-	model:$('model'), gate:$('gate'), keyInput:$('keyInput'), keyErr:$('keyErr')};
+	model:$('model'), gate:$('gate'), keyInput:$('keyInput'), keyErr:$('keyErr'), preset:$('preset')};
 
 const WORDS = {idle:['Tap to start','Then just talk. It listens, answers out loud, and keeps notes.'],
 	listening:['Listening','Go quiet for a moment and it sends.'],
@@ -489,7 +502,7 @@ function apiError(e){
 }
 function applyResult(r){
 	if (!r || typeof r !== 'object') return;
-	if (typeof r.format === 'string' && r.format.trim() && r.format.trim() !== S.format){ S.format = r.format.trim(); el.fmt.value = S.format; saveSettings(); say('sys','Note format updated.'); }
+	if (typeof r.format === 'string' && r.format.trim() && r.format.trim() !== S.format){ S.format = r.format.trim(); el.fmt.value = S.format; syncPreset(); saveSettings(); say('sys','Note format updated.'); }
 	if (typeof r.notes_rewrite === 'string' && r.notes_rewrite.trim()){ S.notes = r.notes_rewrite.trim(); saveNotes(); }
 	else if (typeof r.notes_append === 'string' && r.notes_append.trim()){ S.notes = (S.notes ? S.notes.replace(/\s+$/,'') + '\n\n' : '') + r.notes_append.trim(); saveNotes(); }
 }
@@ -504,6 +517,27 @@ function renderNotes(){ el.notesView.textContent = S.notes; el.notesMeta.textCon
 function saveNotes(){ S.notesUpdated = Date.now(); LS.set('notes', {text:S.notes, updatedAt:S.notesUpdated}); renderNotes(); }
 function saveSettings(){ LS.set('settings', S.settings); LS.set('format', S.format); }
 function saveSession(){ LS.set('turns', S.turns.slice(-24)); }
+async function saveToFile(){
+	if (!S.notes){ say('sys','There are no notes to save yet.'); return; }
+	const name = 'design-notes-' + new Date().toISOString().slice(0,10) + '.md';
+	if (window.showSaveFilePicker){
+		try{
+			if (!S.fileHandle) S.fileHandle = await window.showSaveFilePicker({suggestedName:name, types:[{description:'Markdown', accept:{'text/markdown':['.md']}}]});
+			const w = await S.fileHandle.createWritable();
+			await w.write(S.notes); await w.close();
+			say('sys','Saved to ' + S.fileHandle.name + '. Tapping this again overwrites that same file.');
+			return;
+		}catch(e){ if (e && e.name === 'AbortError') return; S.fileHandle = null; }
+	}
+	try{
+		const url = URL.createObjectURL(new Blob([S.notes], {type:'text/markdown'}));
+		const a = document.createElement('a'); a.href = url; a.download = name;
+		document.body.appendChild(a); a.click(); a.remove();
+		setTimeout(() => URL.revokeObjectURL(url), 2000);
+		say('sys','Saved ' + name + ' to your downloads.');
+	}catch(e){ say('sys','This browser would not save the file. Use Copy or Share instead.'); }
+}
+$('saveFile').addEventListener('click', saveToFile);
 $('copyNotes').addEventListener('click', async () => { try{ await navigator.clipboard.writeText(S.notes); say('sys','Notes copied.'); }catch(e){ say('sys','Could not copy. Select the text instead.'); } });
 $('readNotes').addEventListener('click', () => { unlockAudio(); speakThen(S.notes || 'There are no notes yet.'); });
 $('shareNotes').addEventListener('click', async () => {
@@ -516,14 +550,24 @@ $('forgetKey').addEventListener('click', () => { if (!confirm('Forget the API ke
 
 /* ---------- Settings ---------- */
 function bindSettings(){
-	el.fmt.value = S.format; el.model.value = S.settings.model;
+	el.fmt.value = S.format; el.model.value = S.settings.model; syncPreset();
 	el.rate.value = S.settings.rate; el.rateVal.textContent = Number(S.settings.rate).toFixed(2)+'×';
 	el.lang.value = S.settings.lang; el.silence.value = S.settings.silence; el.silenceVal.textContent = Number(S.settings.silence).toFixed(1)+' s';
 	el.voice.value = S.settings.voice || '';
 	el.chip.textContent = el.model.options[el.model.selectedIndex] ? el.model.options[el.model.selectedIndex].text.split(' —')[0] : S.settings.model;
 }
+function syncPreset(){
+	const hit = Object.keys(PRESETS).find(k => PRESETS[k].text === S.format);
+	el.preset.value = hit || 'custom';
+}
+el.preset.addEventListener('change', () => {
+	const p = PRESETS[el.preset.value];
+	if (!p) return;
+	S.format = p.text; el.fmt.value = p.text; saveSettings();
+	say('sys','New notes will be kept as a ' + p.label.toLowerCase() + '. Ask me to rewrite the existing ones if you want those converted too.');
+});
 let fmtTimer = 0;
-el.fmt.addEventListener('input', () => { clearTimeout(fmtTimer); fmtTimer = setTimeout(() => { S.format = el.fmt.value.trim() || DEFAULT_FORMAT; saveSettings(); }, 800); });
+el.fmt.addEventListener('input', () => { clearTimeout(fmtTimer); fmtTimer = setTimeout(() => { S.format = el.fmt.value.trim() || DEFAULT_FORMAT; syncPreset(); saveSettings(); }, 800); });
 el.model.addEventListener('change', () => { S.settings.model = el.model.value; saveSettings(); bindSettings(); });
 el.voice.addEventListener('change', () => { S.settings.voice = el.voice.value; saveSettings(); });
 el.rate.addEventListener('input', () => { S.settings.rate = Number(el.rate.value); el.rateVal.textContent = S.settings.rate.toFixed(2)+'×'; });
